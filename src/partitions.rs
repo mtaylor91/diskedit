@@ -1,100 +1,64 @@
 use gpt;
 use uuid::Uuid;
 
-use crate::util::Result;
-
-
-#[derive(Clone, Copy, Debug)]
-enum Offset {
-    Bytes(u64),
-    Kilobytes(u64),
-    Megabytes(u64),
-    Gigabytes(u64),
-    Percent(u8),
-}
+use crate::util::{Offset, Result};
 
 
 struct Partition {
     name: Option<String>,
     start: Offset,
     end: Offset,
+    partition_type: gpt::partition_types::Type,
 }
 
 impl Partition {
     fn size(&self, relative_to: u64) -> u64 {
-        let start = match self.start {
-            Offset::Bytes(start) => start,
-            Offset::Kilobytes(start) => start * 1024,
-            Offset::Megabytes(start) => start * 1024 * 1024,
-            Offset::Gigabytes(start) => start * 1024 * 1024 * 1024,
-            Offset::Percent(start) => {
-                (relative_to as f64 * (start as f64 / 100.0)) as u64
-            },
-        };
-
-        let end = match self.end {
-            Offset::Bytes(end) => end,
-            Offset::Kilobytes(end) => end * 1024,
-            Offset::Megabytes(end) => end * 1024 * 1024,
-            Offset::Gigabytes(end) => end * 1024 * 1024 * 1024,
-            Offset::Percent(end) => {
-                (relative_to as f64 * (end as f64 / 100.0)) as u64
-            },
-        };
-
+        let start = self.start.to_bytes(relative_to);
+        let end = self.end.to_bytes(relative_to);
         end - start
     }
 }
 
+
+fn parse_partition_type(partition_type: &str) -> Result<gpt::partition_types::Type> {
+    match gpt::partition_types::Type::from_name(partition_type) {
+        Ok(t) => Ok(t),
+        Err(_) => Err(crate::util::Error::InvalidPartitionType),
+    }
+}
+
+
 fn parse_partition(partition: &str) -> Result<Partition> {
     let spec = partition.split(':').collect::<Vec<&str>>();
-
-    if spec.len() < 2 || spec.len() > 3 {
-        return Err(crate::util::Error::InvalidPartitionSpecification);
-    }
-
-    let name = if spec.len() == 3 {
-        Some(spec[0].to_string())
-    } else {
-        None
+    let (name, start, end, partition_type) = match Offset::parse(spec[0]) {
+        Ok(start) => {
+            let end = Offset::parse(spec[1])?;
+            let partition_type = if spec.len() == 3 {
+                parse_partition_type(spec[2])?
+            } else {
+                gpt::partition_types::LINUX_FS
+            };
+            (None, start, end, partition_type)
+        },
+        Err(_) => {
+            let name = spec[0].to_string();
+            let start = Offset::parse(spec[1])?;
+            let end = Offset::parse(spec[2])?;
+            let partition_type = if spec.len() == 4 {
+                parse_partition_type(spec[3])?
+            } else {
+                gpt::partition_types::LINUX_FS
+            };
+            (Some(name), start, end, partition_type)
+        },
     };
-
-    let start = parse_partition_offset(spec[spec.len() - 2])?;
-    let end = parse_partition_offset(spec[spec.len() - 1])?;
 
     Ok(Partition {
         name,
         start,
         end,
+        partition_type,
     })
-}
-
-
-fn parse_partition_offset(offset: &str) -> Result<Offset> {
-    let offset = offset.trim();
-
-    if offset.ends_with('%') {
-        let percent = offset.trim_end_matches('%').parse::<u8>()?;
-        if percent > 100 {
-            return Err(crate::util::Error::InvalidPartitionSpecification);
-        }
-        return Ok(Offset::Percent(percent));
-    } else if offset.ends_with('K') {
-        let kilobytes = offset.trim_end_matches('K').parse::<u64>()?;
-        return Ok(Offset::Kilobytes(kilobytes));
-    } else if offset.ends_with('M') {
-        let megabytes = offset.trim_end_matches('M').parse::<u64>()?;
-        return Ok(Offset::Megabytes(megabytes));
-    } else if offset.ends_with('G') {
-        let gigabytes = offset.trim_end_matches('G').parse::<u64>()?;
-        return Ok(Offset::Gigabytes(gigabytes));
-    } else if offset.ends_with('B') {
-        let bytes = offset.trim_end_matches('B').parse::<u64>()?;
-        return Ok(Offset::Bytes(bytes));
-    } else {
-        let bytes = offset.parse::<u64>()?;
-        return Ok(Offset::Bytes(bytes));
-    }
 }
 
 
@@ -161,11 +125,12 @@ pub fn write_partitions(device: &str, partitions: Vec<&str>) -> Result<()> {
     // Create new partitions
     for partition in partitions {
         let partition_size = partition.size(device_size);
+        let partition_type = partition.partition_type;
         let partition_name = &partition.name.unwrap_or("".to_string());
         disk.add_partition(
             partition_name,
             partition_size,
-            gpt::partition_types::LINUX_FS,
+            partition_type,
             0,
             None,
         )?;
